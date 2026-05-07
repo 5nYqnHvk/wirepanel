@@ -115,6 +115,9 @@ func (a *JSONLAudit) MarkRolledBack(id, by string, err error) (*AuditEntry, bool
 	info := &AuditRollbackInfo{At: time.Now().UTC(), By: by}
 	if err != nil {
 		info.Error = err.Error()
+		if e.Status == AuditStatusRollingBack {
+			e.Status = AuditStatusOK
+		}
 	} else {
 		e.Status = AuditStatusRolledBack
 	}
@@ -124,15 +127,70 @@ func (a *JSONLAudit) MarkRolledBack(id, by string, err error) (*AuditEntry, bool
 	return e, true
 }
 
-func (a *JSONLAudit) Get(id string) (*AuditEntry, bool) {
+func (a *JSONLAudit) BeginRollback(id string) (*AuditEntry, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	e, ok := a.idx[id]
 	if !ok {
+		a.mu.Unlock()
+		if disk, found := a.loadByID(id); found {
+			a.mu.Lock()
+			if _, exists := a.idx[id]; !exists {
+				a.idx[id] = disk
+			}
+			e = a.idx[id]
+		} else {
+			return nil, ErrAuditNotFound
+		}
+	}
+	defer a.mu.Unlock()
+	if !e.Reversible {
+		return nil, ErrAuditNotReversible
+	}
+	switch e.Status {
+	case AuditStatusRolledBack:
+		return nil, ErrAuditAlreadyRolledBack
+	case AuditStatusRollingBack:
+		return nil, ErrAuditRollbackInProgress
+	}
+	e.Status = AuditStatusRollingBack
+	cp := *e
+	return &cp, nil
+}
+
+func (a *JSONLAudit) Get(id string) (*AuditEntry, bool) {
+	a.mu.Lock()
+	if e, ok := a.idx[id]; ok {
+		cp := *e
+		a.mu.Unlock()
+		return &cp, true
+	}
+	a.mu.Unlock()
+	return a.loadByID(id)
+}
+
+func (a *JSONLAudit) loadByID(id string) (*AuditEntry, bool) {
+	path := filepath.Join(a.dir, "audit.jsonl")
+	f, err := os.Open(path)
+	if err != nil {
 		return nil, false
 	}
-	cp := *e
-	return &cp, true
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	var match *AuditEntry
+	for {
+		var e AuditEntry
+		if err := dec.Decode(&e); err != nil {
+			break
+		}
+		if e.ID == id {
+			ec := e
+			match = &ec
+		}
+	}
+	if match == nil {
+		return nil, false
+	}
+	return match, true
 }
 
 func (a *JSONLAudit) Recent(limit int) []*AuditEntry {
@@ -158,7 +216,9 @@ func (a *JSONLAudit) append(e *AuditEntry) {
 func (a *JSONLAudit) appendLocked(e *AuditEntry) {
 	b, _ := json.Marshal(e)
 	b = append(b, '\n')
-	_, _ = a.file.Write(b)
+	if _, werr := a.file.Write(b); werr == nil {
+		_ = a.file.Sync()
+	}
 	if existing, ok := a.idx[e.ID]; ok {
 		*existing = *e
 		return
@@ -166,8 +226,6 @@ func (a *JSONLAudit) appendLocked(e *AuditEntry) {
 	a.entries = append(a.entries, e)
 	a.idx[e.ID] = e
 	if len(a.entries) > a.cap {
-		drop := a.entries[0]
-		delete(a.idx, drop.ID)
 		a.entries = a.entries[1:]
 	}
 }

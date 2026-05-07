@@ -98,7 +98,6 @@ func (h *Handler) DispatchTask() http.HandlerFunc {
 		meta.Args = map[string]any{"command": req.Command, "task_id": taskID}
 		meta.Reversible = false
 		entry := h.audit().Begin(meta)
-		h.audit().Commit(entry, nil)
 
 		payload, _ := json.Marshal(proto.TaskDispatchPayload{
 			TaskID:  taskID,
@@ -108,8 +107,11 @@ func (h *Handler) DispatchTask() http.HandlerFunc {
 			Timeout: req.Timeout,
 		})
 		env := proto.Envelope{ID: taskID, Type: proto.MsgTaskDispatch, Payload: payload}
-		if err := conn.Send(env); err != nil {
-			http.Error(w, "send failed", http.StatusInternalServerError)
+		sendErr := conn.Send(env)
+		h.audit().Commit(entry, sendErr)
+		if sendErr != nil {
+			h.hub.Unsubscribe(taskID)
+			http.Error(w, "send failed: "+sendErr.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -194,24 +196,26 @@ func (h *Handler) AuditRollback() http.HandlerFunc {
 			http.Error(w, "confirm=true required", http.StatusBadRequest)
 			return
 		}
-		entry, ok := h.audit().Get(id)
-		if !ok {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		if !entry.Reversible {
-			http.Error(w, "audit entry is not reversible", http.StatusBadRequest)
-			return
-		}
-		if entry.Status == featgate.AuditStatusRolledBack {
-			http.Error(w, "already rolled back", http.StatusConflict)
-			return
-		}
-		err := h.executeRollback(r, entry)
-		who := auth.IdentityFromContext(r.Context()).Username
-		updated, _ := h.audit().MarkRolledBack(id, who, err)
+		entry, err := h.audit().BeginRollback(id)
 		if err != nil {
-			http.Error(w, "rollback failed: "+err.Error(), http.StatusBadGateway)
+			switch {
+			case errors.Is(err, featgate.ErrAuditNotFound):
+				http.Error(w, err.Error(), http.StatusNotFound)
+			case errors.Is(err, featgate.ErrAuditNotReversible):
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			case errors.Is(err, featgate.ErrAuditAlreadyRolledBack),
+				errors.Is(err, featgate.ErrAuditRollbackInProgress):
+				http.Error(w, err.Error(), http.StatusConflict)
+			default:
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		rerr := h.executeRollback(r, entry)
+		who := auth.IdentityFromContext(r.Context()).Username
+		updated, _ := h.audit().MarkRolledBack(id, who, rerr)
+		if rerr != nil {
+			http.Error(w, "rollback failed: "+rerr.Error(), http.StatusBadGateway)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

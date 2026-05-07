@@ -2,9 +2,17 @@ package featgate
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/wirepanel/wirepanel/shared/perms"
+)
+
+var (
+	ErrAuditNotFound           = errors.New("audit entry not found")
+	ErrAuditNotReversible      = errors.New("audit entry is not reversible")
+	ErrAuditAlreadyRolledBack  = errors.New("audit entry already rolled back")
+	ErrAuditRollbackInProgress = errors.New("audit entry rollback in progress")
 )
 
 type Edition string
@@ -37,9 +45,10 @@ func (e Edition) AtLeast(min Edition) bool {
 type AuditStatus string
 
 const (
-	AuditStatusOK         AuditStatus = "ok"
-	AuditStatusFailed     AuditStatus = "failed"
-	AuditStatusRolledBack AuditStatus = "rolled_back"
+	AuditStatusOK          AuditStatus = "ok"
+	AuditStatusFailed      AuditStatus = "failed"
+	AuditStatusRollingBack AuditStatus = "rolling_back"
+	AuditStatusRolledBack  AuditStatus = "rolled_back"
 )
 
 type AuditEntry struct {
@@ -84,6 +93,7 @@ type Audit interface {
 	Commit(*AuditEntry, error) *AuditEntry
 	Recent(limit int) []*AuditEntry
 	Get(id string) (*AuditEntry, bool)
+	BeginRollback(id string) (*AuditEntry, error)
 	MarkRolledBack(id, by string, err error) (*AuditEntry, bool)
 }
 

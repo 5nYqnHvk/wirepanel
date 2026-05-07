@@ -67,6 +67,7 @@ func (noopAudit) Begin(featgate.AuditStartArgs) *featgate.AuditEntry            
 func (noopAudit) Commit(e *featgate.AuditEntry, _ error) *featgate.AuditEntry              { return e }
 func (noopAudit) Recent(int) []*featgate.AuditEntry                                        { return []*featgate.AuditEntry{} }
 func (noopAudit) Get(string) (*featgate.AuditEntry, bool)                                  { return nil, false }
+func (noopAudit) BeginRollback(string) (*featgate.AuditEntry, error)                       { return nil, featgate.ErrAuditNotFound }
 func (noopAudit) MarkRolledBack(string, string, error) (*featgate.AuditEntry, bool)        { return nil, false }
 
 var _ featgate.Audit = noopAudit{}
