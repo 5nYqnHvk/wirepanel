@@ -10,6 +10,7 @@ import (
 	"time"
 
 	wpfs "github.com/wirepanel/wirepanel/agent/internal/fs"
+	wpfspath "github.com/wirepanel/wirepanel/agent/internal/fspath"
 	"github.com/wirepanel/wirepanel/agent/internal/svc"
 	"github.com/wirepanel/wirepanel/agent/internal/sysinfo"
 	"github.com/wirepanel/wirepanel/shared/proto"
@@ -23,10 +24,24 @@ type Result struct {
 	Err      error
 }
 
-type Executor struct{}
+type Executor struct {
+	policy wpfspath.Policy
+}
 
 func New() *Executor {
-	return &Executor{}
+	return &Executor{policy: wpfspath.Load()}
+}
+
+func (e *Executor) checkFS(paths ...string) error {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if err := e.policy.Check(p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *Executor) Run(ctx context.Context, task proto.TaskDispatchPayload, logFn LogFunc) Result {
@@ -34,18 +49,39 @@ func (e *Executor) Run(ctx context.Context, task proto.TaskDispatchPayload, logF
 	case proto.TaskShell:
 		return e.runShell(ctx, task, logFn)
 	case proto.TaskFSList:
+		if err := e.checkFS(task.Args["path"]); err != nil {
+			return Result{ExitCode: 1, Err: err}
+		}
 		return wrap(wpfs.List(task.Args["path"]))
 	case proto.TaskFSRead:
+		if err := e.checkFS(task.Args["path"]); err != nil {
+			return Result{ExitCode: 1, Err: err}
+		}
 		return wrap(wpfs.Read(task.Args["path"]))
 	case proto.TaskFSWrite:
+		if err := e.checkFS(task.Args["path"]); err != nil {
+			return Result{ExitCode: 1, Err: err}
+		}
 		return wrap(wpfs.Write(task.Args["path"], task.Body, parseMode(task.Args["mode"])))
 	case proto.TaskFSDelete:
+		if err := e.checkFS(task.Args["path"]); err != nil {
+			return Result{ExitCode: 1, Err: err}
+		}
 		return wrap(wpfs.Delete(task.Args["path"], task.Args["recursive"] == "true", task.Args["trash_id"], task.Args["trash_dir"]))
 	case proto.TaskFSMkdir:
+		if err := e.checkFS(task.Args["path"]); err != nil {
+			return Result{ExitCode: 1, Err: err}
+		}
 		return wrap(wpfs.Mkdir(task.Args["path"], parseMode(task.Args["mode"])))
 	case proto.TaskFSStat:
+		if err := e.checkFS(task.Args["path"]); err != nil {
+			return Result{ExitCode: 1, Err: err}
+		}
 		return wrap(wpfs.Stat(task.Args["path"]))
 	case proto.TaskFSRestore:
+		if err := e.checkFS(task.Args["original_path"]); err != nil {
+			return Result{ExitCode: 1, Err: err}
+		}
 		return wrap(wpfs.Restore(task.Args["trash_path"], task.Args["original_path"]))
 	case proto.TaskServiceList:
 		return wrap(svc.List(ctx))
