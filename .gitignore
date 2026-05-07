@@ -7,3 +7,4 @@ dist/
 .env.local
 .DS_Store
 *.tsbuildinfo
+wirepanel_lockspec_v1.md
