@@ -23,19 +23,38 @@ import (
 func main() {
 	cfg := config.Load()
 
+	if cfg.Env == "production" {
+		if cfg.AgentToken == "" || cfg.AgentToken == "dev-shared-token" {
+			log.Fatal("WP_AGENT_TOKEN must be set (and not the default) in production")
+		}
+		if cfg.JWTSecret == "" || cfg.JWTSecret == "dev-secret-change-me" {
+			log.Fatal("WP_JWT_SECRET must be set (and not the default) in production")
+		}
+		if len(cfg.AllowedOrigins) == 0 {
+			log.Fatal("WP_ALLOWED_ORIGINS must be set in production (comma-separated origin list)")
+		}
+		if cfg.AdminPass == "wirepanel" {
+			log.Fatal("WP_ADMIN_PASS must not be the default value in production")
+		}
+		if cfg.TLSCert == "" || cfg.TLSKey == "" {
+			log.Println("WARNING: production without TLS — terminate TLS at a trusted reverse proxy")
+		}
+	}
+
 	provider, err := featboot.New(featgate.Config{
 		DataDir:   cfg.DataDir,
 		AuditDir:  cfg.AuditDir,
 		AdminUser: cfg.AdminUser,
 		AdminPass: cfg.AdminPass,
+		Env:       cfg.Env,
 	})
 	if err != nil {
 		log.Fatalf("featboot: %v", err)
 	}
 
 	registry := agents.NewRegistry()
-	hub := ws.NewHub(registry, cfg.AgentToken, cfg.AllowedOrigins)
-	authH := auth.NewHandler(cfg.JWTSecret, cfg.Env, provider)
+	hub := ws.NewHub(registry, cfg.AgentToken, cfg.AllowedOrigins, cfg.Env == "production")
+	authH := auth.NewHandler(cfg.JWTSecret, cfg.Env, cfg.TrustedProxies, provider)
 	apiH := api.NewHandler(registry, hub, provider, fspath.Policy{AllowSensitive: cfg.FSAllowSensitive})
 
 	mux := http.NewServeMux()
@@ -52,12 +71,18 @@ func main() {
 	authed := func(handler http.HandlerFunc) http.Handler {
 		return authH.Middleware(handler)
 	}
+	authedStream := func(handler http.HandlerFunc) http.Handler {
+		return authH.MiddlewareStream(handler)
+	}
+	gateStream := func(p perms.Permission, handler http.HandlerFunc) http.Handler {
+		return authH.MiddlewareStream(authH.Require(p, handler))
+	}
 
 	mux.Handle("GET /api/auth/me", authed(authH.Me()))
 
 	mux.Handle("GET /api/agents", gate(perms.AgentsRead, apiH.ListAgents()))
 	mux.Handle("POST /api/tasks", authed(apiH.DispatchTask()))
-	mux.Handle("GET /api/tasks/stream", authed(apiH.TaskStream()))
+	mux.Handle("GET /api/tasks/stream", authedStream(apiH.TaskStream()))
 
 	mux.Handle("GET /api/agents/{id}/system", gate(perms.SystemRead, apiH.SystemInfo()))
 	mux.Handle("GET /api/agents/{id}/services", gate(perms.ServicesRead, apiH.ServiceList()))
@@ -70,7 +95,7 @@ func main() {
 	mux.Handle("POST /api/agents/{id}/fs/delete", gate(perms.FSDelete, apiH.FSDelete()))
 	mux.Handle("POST /api/agents/{id}/fs/mkdir", gate(perms.FSMkdir, apiH.FSMkdir()))
 
-	mux.Handle("GET /api/agents/{id}/terminal", gate(perms.Terminal, apiH.Terminal()))
+	mux.Handle("GET /api/agents/{id}/terminal", gateStream(perms.Terminal, apiH.Terminal()))
 
 	if provider.Audit().Enabled() {
 		mux.Handle("GET /api/audit", gate(perms.AuditRead, apiH.AuditList()))

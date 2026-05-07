@@ -2,6 +2,9 @@ package ws
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
@@ -19,38 +22,63 @@ type Conn struct {
 	c       *websocket.Conn
 	send    chan proto.Envelope
 	hub     *Hub
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+type TaskOwner struct {
+	UserID   string
+	Username string
+	AgentID  string
 }
 
 type Hub struct {
-	mu       sync.RWMutex
-	conns    map[string]*Conn
-	registry *agents.Registry
-	token    string
-	origins  []string
+	mu             sync.RWMutex
+	conns          map[string]*Conn
+	registry       *agents.Registry
+	masterToken    string
+	origins        []string
+	strictOrigins  bool
 
-	taskMu   sync.RWMutex
-	taskSubs map[string]chan proto.Envelope
+	taskMu     sync.RWMutex
+	taskSubs   map[string]chan proto.Envelope
+	taskTimers map[string]*time.Timer
+	taskOwners map[string]TaskOwner
 
 	termMu   sync.RWMutex
 	termSubs map[string]chan proto.Envelope
 }
 
-func NewHub(reg *agents.Registry, agentToken string, allowedOrigins []string) *Hub {
+func NewHub(reg *agents.Registry, masterToken string, allowedOrigins []string, strictOrigins bool) *Hub {
 	return &Hub{
-		conns:    make(map[string]*Conn),
-		registry: reg,
-		token:    agentToken,
-		origins:  allowedOrigins,
-		taskSubs: make(map[string]chan proto.Envelope),
-		termSubs: make(map[string]chan proto.Envelope),
+		conns:         make(map[string]*Conn),
+		registry:      reg,
+		masterToken:   masterToken,
+		origins:       allowedOrigins,
+		strictOrigins: strictOrigins,
+		taskSubs:      make(map[string]chan proto.Envelope),
+		taskTimers:    make(map[string]*time.Timer),
+		taskOwners:    make(map[string]TaskOwner),
+		termSubs:      make(map[string]chan proto.Envelope),
 	}
 }
 
+// DeriveAgentToken returns the per-agent token bound to agentID using the
+// shared master token via HMAC-SHA256. Agents must send this derived value.
+func DeriveAgentToken(master, agentID string) string {
+	mac := hmac.New(sha256.New, []byte(master))
+	mac.Write([]byte(agentID))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func (h *Hub) AcceptOptions() *websocket.AcceptOptions {
-	if len(h.origins) == 0 {
-		return &websocket.AcceptOptions{InsecureSkipVerify: true}
+	if len(h.origins) > 0 {
+		return &websocket.AcceptOptions{OriginPatterns: h.origins}
 	}
-	return &websocket.AcceptOptions{OriginPatterns: h.origins}
+	if h.strictOrigins {
+		return &websocket.AcceptOptions{}
+	}
+	return &websocket.AcceptOptions{InsecureSkipVerify: true}
 }
 
 func (h *Hub) Handler() http.HandlerFunc {
@@ -72,7 +100,14 @@ func (h *Hub) Handler() http.HandlerFunc {
 			return
 		}
 
-		conn := &Conn{AgentID: ag.ID, c: c, send: make(chan proto.Envelope, 256), hub: h}
+		conn := &Conn{
+			AgentID: ag.ID,
+			c:       c,
+			send:    make(chan proto.Envelope, 256),
+			hub:     h,
+			ctx:     ctx,
+			cancel:  cancel,
+		}
 		h.add(conn)
 		defer h.remove(conn)
 
@@ -102,12 +137,20 @@ func (h *Hub) handshake(ctx context.Context, c *websocket.Conn) (*agents.Agent, 
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return nil, err
 	}
-	if p.Token != h.token {
+	if p.AgentID == "" {
+		writeEnvelope(rctx, c, proto.Envelope{
+			ID: env.ID, Type: proto.MsgRegisterAck,
+			Payload: mustJSON(proto.RegisterAckPayload{OK: false, Message: "agent_id required"}),
+		})
+		return nil, errors.New("missing agent_id")
+	}
+	expected := DeriveAgentToken(h.masterToken, p.AgentID)
+	if !hmac.Equal([]byte(p.Token), []byte(expected)) {
 		writeEnvelope(rctx, c, proto.Envelope{
 			ID: env.ID, Type: proto.MsgRegisterAck,
 			Payload: mustJSON(proto.RegisterAckPayload{OK: false, Message: "bad token"}),
 		})
-		return nil, errors.New("bad token")
+		return nil, errors.New("bad token for agent " + p.AgentID)
 	}
 	ag := &agents.Agent{
 		ID: p.AgentID, Hostname: p.Hostname, OS: p.OS, Arch: p.Arch, Version: p.Version,
@@ -125,16 +168,24 @@ func (h *Hub) handshake(ctx context.Context, c *websocket.Conn) (*agents.Agent, 
 
 func (h *Hub) add(c *Conn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	prev, dup := h.conns[c.AgentID]
 	h.conns[c.AgentID] = c
+	h.mu.Unlock()
+	if dup && prev != nil {
+		log.Printf("agent %s reconnected; closing prior connection", c.AgentID)
+		prev.cancel()
+		_ = prev.c.Close(websocket.StatusPolicyViolation, "superseded by new connection")
+	}
 }
 
 func (h *Hub) remove(c *Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.conns, c.AgentID)
-	h.registry.Remove(c.AgentID)
-	close(c.send)
+	if cur, ok := h.conns[c.AgentID]; ok && cur == c {
+		delete(h.conns, c.AgentID)
+		h.registry.Remove(c.AgentID)
+		close(c.send)
+	}
 }
 
 func (h *Hub) Get(agentID string) (*Conn, bool) {
@@ -145,11 +196,13 @@ func (h *Hub) Get(agentID string) (*Conn, bool) {
 }
 
 func (c *Conn) Send(env proto.Envelope) error {
+	t := time.NewTimer(5 * time.Second)
+	defer t.Stop()
 	select {
 	case c.send <- env:
 		return nil
-	default:
-		return errors.New("send buffer full")
+	case <-t.C:
+		return errors.New("send timeout")
 	}
 }
 
@@ -215,18 +268,38 @@ func (h *Hub) Subscribe(taskID string) chan proto.Envelope {
 
 func (h *Hub) Unsubscribe(taskID string) {
 	h.taskMu.Lock()
+	if t, ok := h.taskTimers[taskID]; ok {
+		t.Stop()
+		delete(h.taskTimers, taskID)
+	}
 	if ch, ok := h.taskSubs[taskID]; ok {
 		delete(h.taskSubs, taskID)
 		close(ch)
 	}
+	delete(h.taskOwners, taskID)
 	h.taskMu.Unlock()
 }
 
 func (h *Hub) UnsubscribeAfter(taskID string, d time.Duration) {
-	go func() {
-		time.Sleep(d)
-		h.Unsubscribe(taskID)
-	}()
+	h.taskMu.Lock()
+	if t, ok := h.taskTimers[taskID]; ok {
+		t.Stop()
+	}
+	h.taskTimers[taskID] = time.AfterFunc(d, func() { h.Unsubscribe(taskID) })
+	h.taskMu.Unlock()
+}
+
+func (h *Hub) RegisterTaskOwner(taskID string, owner TaskOwner) {
+	h.taskMu.Lock()
+	h.taskOwners[taskID] = owner
+	h.taskMu.Unlock()
+}
+
+func (h *Hub) TaskOwner(taskID string) (TaskOwner, bool) {
+	h.taskMu.RLock()
+	defer h.taskMu.RUnlock()
+	o, ok := h.taskOwners[taskID]
+	return o, ok
 }
 
 func (h *Hub) deliverTask(env proto.Envelope) {
@@ -256,6 +329,9 @@ func (h *Hub) deliverTask(env proto.Envelope) {
 func (h *Hub) SubscribeTerm(sessionID string) chan proto.Envelope {
 	ch := make(chan proto.Envelope, 1024)
 	h.termMu.Lock()
+	if old, ok := h.termSubs[sessionID]; ok {
+		close(old)
+	}
 	h.termSubs[sessionID] = ch
 	h.termMu.Unlock()
 	return ch

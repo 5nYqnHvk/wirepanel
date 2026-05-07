@@ -2,9 +2,13 @@ package client
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"log"
+	"math/rand/v2"
 	"runtime"
 	"time"
 
@@ -15,13 +19,31 @@ import (
 	"github.com/wirepanel/wirepanel/shared/proto"
 )
 
+const (
+	readDeadline    = 60 * time.Second
+	writeDeadline   = 10 * time.Second
+	minBackoff      = 1 * time.Second
+	maxBackoff      = 30 * time.Second
+	writeBufferSize = 256
+)
+
 type Client struct {
 	cfg  *config.Config
-	conn *websocket.Conn
 	exec *exec.Executor
 	term *term.Manager
+}
 
+type connection struct {
+	conn    *websocket.Conn
 	writeCh chan proto.Envelope
+}
+
+func (cn *connection) send(env proto.Envelope) {
+	select {
+	case cn.writeCh <- env:
+	default:
+		log.Printf("write buffer full, dropping %s", env.Type)
+	}
 }
 
 func New(cfg *config.Config) *Client {
@@ -29,18 +51,32 @@ func New(cfg *config.Config) *Client {
 }
 
 func (c *Client) Run(ctx context.Context) error {
+	backoff := minBackoff
 	for {
 		err := c.connect(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		log.Printf("disconnected: %v, reconnecting in 5s", err)
+		wait := backoff + jitter(backoff)
+		log.Printf("disconnected: %v, reconnecting in %s", err, wait)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(wait):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
 		}
 	}
+}
+
+func jitter(d time.Duration) time.Duration {
+	span := int64(d) / 5
+	if span <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(2*span) - span)
 }
 
 func (c *Client) connect(ctx context.Context) error {
@@ -48,38 +84,40 @@ func (c *Client) connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.conn = conn
-	c.writeCh = make(chan proto.Envelope, 256)
 	conn.SetReadLimit(8 << 20)
 	defer conn.CloseNow()
 
-	if err := c.register(ctx); err != nil {
+	wctx, wcancel := context.WithCancel(ctx)
+	defer wcancel()
+
+	cn := &connection{conn: conn, writeCh: make(chan proto.Envelope, writeBufferSize)}
+
+	if err := c.register(wctx, cn); err != nil {
 		return err
 	}
 	log.Printf("registered as %s", c.cfg.AgentID)
 
-	wctx, wcancel := context.WithCancel(ctx)
-	defer wcancel()
-	go c.writer(wctx)
-
-	return c.readLoop(ctx)
+	go c.writer(wctx, cn)
+	return c.readLoop(wctx, cn)
 }
 
-func (c *Client) register(ctx context.Context) error {
+func (c *Client) register(ctx context.Context, cn *connection) error {
+	derived := deriveAgentToken(c.cfg.Token, c.cfg.AgentID)
 	payload, _ := json.Marshal(proto.RegisterPayload{
 		AgentID:  c.cfg.AgentID,
-		Token:    c.cfg.Token,
+		Token:    derived,
 		Hostname: c.cfg.Hostname,
 		OS:       runtime.GOOS,
 		Arch:     runtime.GOARCH,
 		Version:  "0.1.0",
 	})
 	env := proto.Envelope{ID: "reg-" + c.cfg.AgentID, Type: proto.MsgRegister, Payload: payload}
-	if err := c.directWrite(ctx, env); err != nil {
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := directWrite(rctx, cn.conn, env); err != nil {
 		return err
 	}
-
-	_, data, err := c.conn.Read(ctx)
+	_, data, err := cn.conn.Read(rctx)
 	if err != nil {
 		return err
 	}
@@ -97,9 +135,11 @@ func (c *Client) register(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) readLoop(ctx context.Context) error {
+func (c *Client) readLoop(ctx context.Context, cn *connection) error {
 	for {
-		_, data, err := c.conn.Read(ctx)
+		rctx, cancel := context.WithTimeout(ctx, readDeadline)
+		_, data, err := cn.conn.Read(rctx)
+		cancel()
 		if err != nil {
 			return err
 		}
@@ -109,11 +149,11 @@ func (c *Client) readLoop(ctx context.Context) error {
 		}
 		switch env.Type {
 		case proto.MsgHeartbeat:
-			c.send(proto.Envelope{Type: proto.MsgHeartbeat})
+			cn.send(proto.Envelope{Type: proto.MsgHeartbeat})
 		case proto.MsgTaskDispatch:
-			go c.handleTask(ctx, env)
+			go c.handleTask(ctx, cn, env)
 		case proto.MsgTermOpen:
-			go c.handleTermOpen(ctx, env)
+			go c.handleTermOpen(ctx, cn, env)
 		case proto.MsgTermInput:
 			go c.handleTermInput(env)
 		case proto.MsgTermResize:
@@ -124,7 +164,7 @@ func (c *Client) readLoop(ctx context.Context) error {
 	}
 }
 
-func (c *Client) handleTask(ctx context.Context, env proto.Envelope) {
+func (c *Client) handleTask(ctx context.Context, cn *connection, env proto.Envelope) {
 	var task proto.TaskDispatchPayload
 	if err := json.Unmarshal(env.Payload, &task); err != nil {
 		return
@@ -134,7 +174,7 @@ func (c *Client) handleTask(ctx context.Context, env proto.Envelope) {
 		payload, _ := json.Marshal(proto.TaskLogPayload{
 			TaskID: task.TaskID, Stream: stream, Data: data,
 		})
-		c.send(proto.Envelope{ID: task.TaskID, Type: proto.MsgTaskLog, Payload: payload})
+		cn.send(proto.Envelope{ID: task.TaskID, Type: proto.MsgTaskLog, Payload: payload})
 	}
 
 	res := c.exec.Run(ctx, task, logFn)
@@ -146,10 +186,10 @@ func (c *Client) handleTask(ctx context.Context, env proto.Envelope) {
 	payload, _ := json.Marshal(proto.TaskResultPayload{
 		TaskID: task.TaskID, ExitCode: res.ExitCode, Error: errStr, Data: res.Data,
 	})
-	c.send(proto.Envelope{ID: task.TaskID, Type: proto.MsgTaskResult, Payload: payload})
+	cn.send(proto.Envelope{ID: task.TaskID, Type: proto.MsgTaskResult, Payload: payload})
 }
 
-func (c *Client) handleTermOpen(ctx context.Context, env proto.Envelope) {
+func (c *Client) handleTermOpen(ctx context.Context, cn *connection, env proto.Envelope) {
 	var p proto.TermOpenPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return
@@ -160,25 +200,29 @@ func (c *Client) handleTermOpen(ctx context.Context, env proto.Envelope) {
 		ack.Error = err.Error()
 	}
 	ackPayload, _ := json.Marshal(ack)
-	c.send(proto.Envelope{ID: p.SessionID, Type: proto.MsgTermOpenAck, Payload: ackPayload})
+	cn.send(proto.Envelope{ID: p.SessionID, Type: proto.MsgTermOpenAck, Payload: ackPayload})
 	if err != nil {
 		return
 	}
-	go c.pumpTermOutput(sess)
+	go c.pumpTermOutput(ctx, cn, sess)
 }
 
-func (c *Client) pumpTermOutput(sess *term.Session) {
+func (c *Client) pumpTermOutput(ctx context.Context, cn *connection, sess *term.Session) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := sess.Read(buf)
 		if n > 0 {
 			data := base64.StdEncoding.EncodeToString(buf[:n])
 			payload, _ := json.Marshal(proto.TermDataPayload{SessionID: sess.ID, Data: data})
-			c.send(proto.Envelope{ID: sess.ID, Type: proto.MsgTermOutput, Payload: payload})
+			cn.send(proto.Envelope{ID: sess.ID, Type: proto.MsgTermOutput, Payload: payload})
 		}
 		if err != nil {
 			closePayload, _ := json.Marshal(proto.TermClosePayload{SessionID: sess.ID, Reason: err.Error()})
-			c.send(proto.Envelope{ID: sess.ID, Type: proto.MsgTermClose, Payload: closePayload})
+			cn.send(proto.Envelope{ID: sess.ID, Type: proto.MsgTermClose, Payload: closePayload})
+			c.term.Close(sess.ID)
+			return
+		}
+		if ctx.Err() != nil {
 			c.term.Close(sess.ID)
 			return
 		}
@@ -221,17 +265,17 @@ func (c *Client) handleTermClose(env proto.Envelope) {
 	c.term.Close(p.SessionID)
 }
 
-func (c *Client) writer(ctx context.Context) {
+func (c *Client) writer(ctx context.Context, cn *connection) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case env, ok := <-c.writeCh:
+		case env, ok := <-cn.writeCh:
 			if !ok {
 				return
 			}
-			wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := c.directWrite(wctx, env)
+			wctx, cancel := context.WithTimeout(ctx, writeDeadline)
+			err := directWrite(wctx, cn.conn, env)
 			cancel()
 			if err != nil {
 				log.Printf("write: %v", err)
@@ -241,20 +285,12 @@ func (c *Client) writer(ctx context.Context) {
 	}
 }
 
-func (c *Client) send(env proto.Envelope) {
-	select {
-	case c.writeCh <- env:
-	default:
-		log.Printf("write buffer full, dropping %s", env.Type)
-	}
-}
-
-func (c *Client) directWrite(ctx context.Context, env proto.Envelope) error {
+func directWrite(ctx context.Context, conn *websocket.Conn, env proto.Envelope) error {
 	data, err := json.Marshal(env)
 	if err != nil {
 		return err
 	}
-	return c.conn.Write(ctx, websocket.MessageText, data)
+	return conn.Write(ctx, websocket.MessageText, data)
 }
 
 type RegError struct {
@@ -262,3 +298,9 @@ type RegError struct {
 }
 
 func (e *RegError) Error() string { return "register failed: " + e.Msg }
+
+func deriveAgentToken(master, agentID string) string {
+	mac := hmac.New(sha256.New, []byte(master))
+	mac.Write([]byte(agentID))
+	return hex.EncodeToString(mac.Sum(nil))
+}

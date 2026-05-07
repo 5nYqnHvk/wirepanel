@@ -19,26 +19,12 @@ type confirmable struct {
 	ConfirmPath string `json:"confirm_path"`
 }
 
-func clientIP(r *http.Request) string {
-	if x := r.Header.Get("X-Forwarded-For"); x != "" {
-		if i := strings.IndexByte(x, ','); i > 0 {
-			return strings.TrimSpace(x[:i])
-		}
-		return strings.TrimSpace(x)
-	}
-	host := r.RemoteAddr
-	if i := strings.LastIndexByte(host, ':'); i > 0 {
-		host = host[:i]
-	}
-	return host
-}
-
 func auditMeta(r *http.Request) featgate.AuditStartArgs {
 	id := auth.IdentityFromContext(r.Context())
 	return featgate.AuditStartArgs{
 		User: id.Username,
 		Role: strings.Join(id.RoleIDs, ","),
-		IP:   clientIP(r),
+		IP:   auth.ClientIPFromContext(r.Context()),
 	}
 }
 

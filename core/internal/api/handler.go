@@ -90,6 +90,11 @@ func (h *Handler) DispatchTask() http.HandlerFunc {
 		taskID := uuid.NewString()
 		h.hub.Subscribe(taskID)
 		h.hub.UnsubscribeAfter(taskID, 60*time.Second)
+		h.hub.RegisterTaskOwner(taskID, ws.TaskOwner{
+			UserID:   id.UserID,
+			Username: id.Username,
+			AgentID:  req.AgentID,
+		})
 
 		meta := auditMeta(r)
 		meta.AgentID = req.AgentID
@@ -129,12 +134,23 @@ func (h *Handler) TaskStream() http.HandlerFunc {
 			http.Error(w, "task_id required", http.StatusBadRequest)
 			return
 		}
+		id := auth.IdentityFromContext(r.Context())
+		owner, ok := h.hub.TaskOwner(taskID)
+		if !ok {
+			http.Error(w, "task not found", http.StatusNotFound)
+			return
+		}
+		if owner.UserID != id.UserID && !id.Has(perms.WildcardAll) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming not supported", http.StatusInternalServerError)
 			return
 		}
 		ch := h.hub.Subscribe(taskID)
+		defer h.hub.Unsubscribe(taskID)
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")

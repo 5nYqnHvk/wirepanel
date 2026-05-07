@@ -157,4 +157,5 @@ type Config struct {
 	AuditDir  string
 	AdminUser string
 	AdminPass string
+	Env       string
 }

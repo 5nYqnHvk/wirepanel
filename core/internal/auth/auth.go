@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,11 +34,15 @@ func (i *Identity) Has(p perms.Permission) bool {
 
 type ctxKey int
 
-const ctxIdentityKey ctxKey = 1
+const (
+	ctxIdentityKey ctxKey = iota + 1
+	ctxClientIPKey
+)
 
 type Handler struct {
-	jwtSecret []byte
-	provider  featgate.Provider
+	jwtSecret      []byte
+	provider       featgate.Provider
+	trustedProxies []*net.IPNet
 
 	rateMu sync.Mutex
 	rate   map[string]*bucket
@@ -48,18 +53,47 @@ type bucket struct {
 	last   time.Time
 }
 
-func NewHandler(secret, env string, provider featgate.Provider) *Handler {
-	if env == "production" && (secret == "" || secret == "dev-secret-change-me") {
-		log.Fatal("WP_JWT_SECRET must be set in production")
+func NewHandler(secret, env string, trustedProxies []string, provider featgate.Provider) *Handler {
+	if env == "production" {
+		if secret == "" || secret == "dev-secret-change-me" {
+			log.Fatal("WP_JWT_SECRET must be set (and not the default) in production")
+		}
 	}
 	if secret == "" {
 		secret = "dev-secret-change-me"
 	}
 	return &Handler{
-		jwtSecret: []byte(secret),
-		provider:  provider,
-		rate:      make(map[string]*bucket),
+		jwtSecret:      []byte(secret),
+		provider:       provider,
+		trustedProxies: parseCIDRs(trustedProxies),
+		rate:           make(map[string]*bucket),
 	}
+}
+
+func parseCIDRs(in []string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if !strings.Contains(s, "/") {
+			if ip := net.ParseIP(s); ip != nil {
+				if ip.To4() != nil {
+					s = s + "/32"
+				} else {
+					s = s + "/128"
+				}
+			}
+		}
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			log.Printf("auth: invalid trusted proxy CIDR %q: %v", s, err)
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 func (h *Handler) Edition() featgate.Edition { return h.provider.Edition() }
@@ -105,7 +139,8 @@ type LoginResponse struct {
 
 func (h *Handler) LoginHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !h.allowLogin(clientIP(r)) {
+		ip := h.ClientIP(r)
+		if !h.allowLogin("ip:" + ip) {
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
 		}
@@ -113,6 +148,12 @@ func (h *Handler) LoginHandler() http.HandlerFunc {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
+		}
+		if req.Username != "" {
+			if !h.allowLogin("user:" + req.Username) {
+				http.Error(w, "rate limited", http.StatusTooManyRequests)
+				return
+			}
 		}
 		u, ok := h.provider.Users().VerifyPassword(req.Username, req.Password)
 		if !ok {
@@ -148,8 +189,16 @@ func (h *Handler) Me() http.HandlerFunc {
 }
 
 func (h *Handler) Middleware(next http.Handler) http.Handler {
+	return h.middleware(next, false)
+}
+
+func (h *Handler) MiddlewareStream(next http.Handler) http.Handler {
+	return h.middleware(next, true)
+}
+
+func (h *Handler) middleware(next http.Handler, allowQuery bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := extractToken(r)
+		token := h.extractToken(r, allowQuery)
 		if token == "" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -167,6 +216,7 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 		}
 		id := h.ResolveIdentity(u)
 		ctx := context.WithValue(r.Context(), ctxIdentityKey, id)
+		ctx = context.WithValue(ctx, ctxClientIPKey, h.ClientIP(r))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -190,12 +240,19 @@ func IdentityFromContext(ctx context.Context) *Identity {
 	return v
 }
 
-func extractToken(r *http.Request) string {
+func ClientIPFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(ctxClientIPKey).(string)
+	return v
+}
+
+func (h *Handler) extractToken(r *http.Request, allowQuery bool) string {
 	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
 		return strings.TrimPrefix(a, "Bearer ")
 	}
-	if q := r.URL.Query().Get("access_token"); q != "" {
-		return q
+	if allowQuery {
+		if q := r.URL.Query().Get("access_token"); q != "" {
+			return q
+		}
 	}
 	return ""
 }
@@ -265,18 +322,45 @@ func (h *Handler) allowLogin(ip string) bool {
 	return true
 }
 
-func clientIP(r *http.Request) string {
-	if x := r.Header.Get("X-Forwarded-For"); x != "" {
-		if i := strings.IndexByte(x, ','); i > 0 {
-			return strings.TrimSpace(x[:i])
-		}
-		return strings.TrimSpace(x)
-	}
+func (h *Handler) ClientIP(r *http.Request) string {
 	host := r.RemoteAddr
-	if i := strings.LastIndexByte(host, ':'); i > 0 {
-		host = host[:i]
+	if h2, _, err := net.SplitHostPort(host); err == nil {
+		host = h2
+	}
+	if !h.proxyTrusted(host) {
+		return host
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return host
+	}
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		ip := strings.TrimSpace(parts[i])
+		if ip == "" {
+			continue
+		}
+		if !h.proxyTrusted(ip) {
+			return ip
+		}
 	}
 	return host
+}
+
+func (h *Handler) proxyTrusted(ip string) bool {
+	if len(h.trustedProxies) == 0 {
+		return false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, n := range h.trustedProxies {
+		if n.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 func minF(a, b float64) float64 {

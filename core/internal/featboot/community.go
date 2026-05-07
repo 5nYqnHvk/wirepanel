@@ -27,7 +27,15 @@ func New(cfg featgate.Config) (featgate.Provider, error) {
 		u := cfg.AdminUser
 		p := cfg.AdminPass
 		if u == "" { u = "admin" }
-		if p == "" { p = "wirepanel" }
+		if p == "" {
+			if cfg.Env == "production" {
+				return nil, errors.New("WP_ADMIN_PASS must be set on first boot in production")
+			}
+			p = "wirepanel"
+		}
+		if cfg.Env == "production" && p == "wirepanel" {
+			return nil, errors.New("WP_ADMIN_PASS must not be the default value in production")
+		}
 		if _, err := users.Create(featgate.UserCreateInput{Username: u, Password: p, RoleIDs: []string{featgate.OwnerRoleID}}); err != nil {
 			return nil, err
 		}
